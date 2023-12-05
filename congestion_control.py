@@ -80,6 +80,9 @@ class Sender:
         self._ssthresh = 50
         self._in_slow_start = True if use_slow_start else False
 
+        self._dup_ack_count = 0 
+        self._in_fast_recovery = False
+
         # Construct and buffer SYN packet
         packet = Packet(PacketType.SYN, 0)
         self._buf_slot.acquire()
@@ -153,67 +156,89 @@ class Sender:
         self._transmit(self._last_ack_recv + 1)
 
     def _recv(self):
-        while (not self._shutdown) or (self._last_ack_recv < self._last_seq_sent):
-            # Receive ACK packet
+        while not self._shutdown or self._last_ack_recv < self._last_seq_sent:
             raw = self._ll_endpoint.recv()
             if raw is None:
                 continue
+
             packet = Packet.from_bytes(raw)
             recv_time = datetime.datetime.now()
-            logging.info("Received: {}".format(packet))
+            logging.info(f"Received: {packet}")
 
-            # If no additional data is ACK'd then ignore the ACK
-            if (packet.seq_num <= self._last_ack_recv):
-                continue
-
-            # Update RTT estimate and free ACK'd data 
-            while (self._last_ack_recv < packet.seq_num):
-                self._last_ack_recv += 1
-                slot = self._last_ack_recv % Sender._BUF_SIZE
-
-                # Update RTT estimate
-                send_time = self._buf[slot]["send_time"]
-                if (send_time != None and send_time != 0):
-                    elapsed = recv_time - send_time
-                    self._rtt = self._rtt * 0.9 + elapsed.total_seconds() * 0.1
-                    logging.debug("Updated RTT estimate: {}".format(self._rtt))
-
-                # Free slot
-                self._buf[slot] = None
-                self._buf_slot.release()
-
-            # Adjust for ACK of data that was received before last timeout
-            if (self._last_seq_sent < self._last_ack_recv):
-                self._last_seq_sent = self._last_ack_recv
-
-            # Cancel timer if all in flight data was ACK'd
-            if (self._timer != None and self._last_ack_recv == self._last_seq_sent):
-                self._timer.cancel()
-                self._timer = None
-
-             # Check if slow start is finished
-            if self._in_slow_start and self._cwnd >= self._ssthresh:
-                self._in_slow_start = False
-
-            if self._in_slow_start:
-                # Exponential increase
-                self._cwnd *= 2
+            if packet.seq_num > self._last_ack_recv:
+                self._handle_new_ack(packet.seq_num, recv_time)
             else:
-                # Additive increase (AIMD phase)
-                self._cwnd += 1
-
-
-            # Update congestion window
-            # self._cwnd = self._cwnd + 1 / self._cwnd
-            logging.debug("CWND: {}".format(self._cwnd))
-            self._plotter.update_cwnd(self._cwnd)
-
-            # Send next packet while packets are available and congestion window allows
-            while  ((self._last_seq_sent < self._last_seq_written) and
-                    (self._last_seq_sent - self._last_ack_recv < int(self._cwnd))):
-                self._transmit(self._last_seq_sent + 1)
+                self._handle_duplicate_ack(packet.seq_num)
 
         self._ll_endpoint.shutdown()
+
+    def _handle_new_ack(self, ack_num, recv_time):
+        # New ACK received
+        self._dup_ack_count = 0  # Reset duplicate ACK counter
+
+        while self._last_ack_recv < ack_num:
+            self._last_ack_recv += 1
+            slot = self._last_ack_recv % Sender._BUF_SIZE
+
+            send_time = self._buf[slot]["send_time"]
+            if send_time is not None and send_time != 0:
+                elapsed = recv_time - send_time
+                self._rtt = self._rtt * 0.9 + elapsed.total_seconds() * 0.1
+                logging.debug(f"Updated RTT estimate: {self._rtt}")
+
+            self._buf[slot] = None
+            self._buf_slot.release()
+
+        if self._in_fast_recovery:
+            # Exiting Fast Recovery
+            self._cwnd = self._ssthresh
+            self._in_fast_recovery = False
+            logging.info(f"Exiting Fast Recovery, deflating cwnd to ssthresh: {self._ssthresh}")
+
+        if self._in_slow_start and self._cwnd >= self._ssthresh:
+            # Transition from Slow Start to Congestion Avoidance
+            self._in_slow_start = False
+
+        if self._in_slow_start:
+            # Slow Start phase
+            self._cwnd *= 2
+        else:
+            # Congestion Avoidance phase
+            self._cwnd += 1
+
+        logging.debug(f"CWND: {self._cwnd}")
+        self._plotter.update_cwnd(self._cwnd)
+        self._send_packets_if_allowed()
+
+    def _handle_duplicate_ack(self, ack_num):
+        if self._use_fast_retransmit:
+            if ack_num == self._last_ack_recv:
+                self._dup_ack_count += 1
+                if self._dup_ack_count == 3:
+                    # Fast Retransmit
+                    self._transmit(self._last_ack_recv + 1)
+
+                    # Enter Fast Recovery
+                    self._ssthresh = max(self._cwnd // 2, 2)
+                    self._cwnd = self._ssthresh + 3
+                    self._in_fast_recovery = True
+                    logging.info(f"Fast Retransmit, new ssthresh: {self._ssthresh}, inflated cwnd: {self._cwnd}")
+
+                elif self._in_fast_recovery:
+                    # Additional duplicate ACK in Fast Recovery
+                    self._cwnd += 1
+                    logging.info(f"Additional duplicate ACK in Fast Recovery, cwnd: {self._cwnd}")
+                    self._send_packets_if_allowed()
+
+    def _send_packets_if_allowed(self):
+        while self._last_seq_sent < self._last_seq_written and \
+            self._last_seq_sent - self._last_ack_recv < int(self._cwnd):
+            next_seq = self._last_seq_sent + 1
+            slot = next_seq % Sender._BUF_SIZE
+            if self._buf[slot] is not None:
+                self._transmit(next_seq)
+            else:
+                break
 
 class Receiver:
     _BUF_SIZE = 1000
