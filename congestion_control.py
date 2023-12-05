@@ -77,6 +77,9 @@ class Sender:
         self._recv_thread = threading.Thread(target=self._recv)
         self._recv_thread.start()
 
+        self._ssthresh = 50
+        self._in_slow_start = True if use_slow_start else False
+
         # Construct and buffer SYN packet
         packet = Packet(PacketType.SYN, 0)
         self._buf_slot.acquire()
@@ -131,7 +134,12 @@ class Sender:
         
     def _timeout(self):
         # Update congestion window
-        self._cwnd = max(1, self._cwnd/2)
+        if self._use_slow_start:
+            self._cwnd = 1
+            self._in_slow_start = True
+        else:
+            self._cwnd = max(1, self._cwnd/2)
+        
         logging.debug("CWND: {}".format(self._cwnd))
         self._plotter.update_cwnd(self._cwnd)
 
@@ -183,8 +191,20 @@ class Sender:
                 self._timer.cancel()
                 self._timer = None
 
+             # Check if slow start is finished
+            if self._in_slow_start and self._cwnd >= self._ssthresh:
+                self._in_slow_start = False
+
+            if self._in_slow_start:
+                # Exponential increase
+                self._cwnd *= 2
+            else:
+                # Additive increase (AIMD phase)
+                self._cwnd += 1
+
+
             # Update congestion window
-            self._cwnd = self._cwnd + 1 / self._cwnd
+            # self._cwnd = self._cwnd + 1 / self._cwnd
             logging.debug("CWND: {}".format(self._cwnd))
             self._plotter.update_cwnd(self._cwnd)
 
